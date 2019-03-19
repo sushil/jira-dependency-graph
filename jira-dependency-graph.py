@@ -1,16 +1,10 @@
 #!/usr/bin/env python
-
-from __future__ import print_function
-
 import argparse
-import json
+import functools
 import sys
 import getpass
 import textwrap
-
 import requests
-
-from collections import OrderedDict
 
 
 GOOGLE_CHART_URL = 'http://chart.apis.google.com/chart'
@@ -32,7 +26,7 @@ class JiraSearch(object):
         self.url = url + '/rest/api/latest'
         self.auth = auth
         self.no_verify_ssl = no_verify_ssl
-        self.fields = ','.join(['key', 'summary', 'status', 'description', 'issuetype', 'issuelinks', 'subtasks'])
+        self.fields = ','.join(['key', 'summary', 'status', 'description', 'issuetype', 'issuelinks', 'subtasks', 'customfield_10008'])
 
     def get(self, uri, params={}):
         headers = {'Content-Type' : 'application/json'}
@@ -79,7 +73,7 @@ def build_graph_data(start_issue_key, jira, excludes, show_directions, direction
     def create_node_text(issue_key, fields, islink=True):
         summary = fields['summary']
         status = fields['status']
-        
+
         if word_wrap == True:
             if len(summary) > MAX_SUMMARY_LENGTH:
                 # split the summary into multiple lines adding a \n to each line
@@ -89,17 +83,18 @@ def build_graph_data(start_issue_key, jira, excludes, show_directions, direction
             # -- otherwise the truncated label would be taking more space than the original.
             if len(summary) > MAX_SUMMARY_LENGTH + 2:
                 summary = fields['summary'][:MAX_SUMMARY_LENGTH] + '...'
-        summary = summary.replace('"', '\\"')
+        summary = summary.replace('"', ' ')
         # log('node ' + issue_key + ' status = ' + str(status))
 
         if islink:
-            return '"{}\\n({})"'.format(issue_key, summary.encode('utf-8'))
-        return '"{}\\n({})" [href="{}", fillcolor="{}", style=filled]'.format(issue_key, summary.encode('utf-8'), jira.get_issue_uri(issue_key), get_status_color(status))
+            return '"{}\\n{}"'.format(issue_key, summary)
+        return '"{}\\n{}" [href="{}", fillcolor="{}", style=filled]'.format(issue_key, summary, jira.get_issue_uri(issue_key), get_status_color(status))
 
     def process_link(fields, issue_key, link):
-        if link.has_key('outwardIssue'):
+
+        if 'outwardIssue' in link:
             direction = 'outward'
-        elif link.has_key('inwardIssue'):
+        elif 'inwardIssue' in link:
             direction = 'inward'
         else:
             return
@@ -112,11 +107,11 @@ def build_graph_data(start_issue_key, jira, excludes, show_directions, direction
         link_type = link['type'][direction]
 
         if ignore_closed:
-            if ('inwardIssue' in link) and (link['inwardIssue']['fields']['status']['name'] in 'Closed'):
-                log('Skipping ' + linked_issue_key + ' - linked key is Closed')
+            if ('inwardIssue' in link) and (link['inwardIssue']['fields']['status']['name'] in ['Closed', 'Done', 'Sandbox', 'Staging', 'Production', 'Merged']):
+                log('Skipping ' + linked_issue_key + ' - linked key is ' + link['inwardIssue']['fields']['status']['name'])
                 return
-            if ('outwardIssue' in link) and (link['outwardIssue']['fields']['status']['name'] in 'Closed'):
-                log('Skipping ' + linked_issue_key + ' - linked key is Closed')
+            if ('outwardIssue' in link) and (link['outwardIssue']['fields']['status']['name'] in ['Closed', 'Done', 'Sandbox', 'Staging', 'Production', 'Merged']):
+                log('Skipping ' + linked_issue_key + ' - linked key is ' + link['outwardIssue']['fields']['status']['name'])
                 return
 
         if includes not in linked_issue_key:
@@ -151,7 +146,7 @@ def build_graph_data(start_issue_key, jira, excludes, show_directions, direction
         fields = issue['fields']
         seen.append(issue_key)
 
-        if ignore_closed and (fields['status']['name'] in 'Closed'):
+        if ignore_closed and (fields['status']['name'] in ['Closed', 'Done', 'Sandbox', 'Staging', 'Production', 'Merged']):
             log('Skipping ' + issue_key + ' - it is Closed')
             return graph
 
@@ -159,6 +154,7 @@ def build_graph_data(start_issue_key, jira, excludes, show_directions, direction
             log('Skipping ' + issue_key + ' - not traversing to a different project')
             return graph
 
+        log(f'+(issue) adding node {issue_key}')
         graph.append(create_node_text(issue_key, fields, islink=False))
 
         if not ignore_subtasks:
@@ -170,19 +166,40 @@ def build_graph_data(start_issue_key, jira, excludes, show_directions, direction
                     node = '{}->{}[color=orange]'.format(
                         create_node_text(issue_key, fields),
                         create_node_text(subtask_key, subtask['fields']))
-                    graph.append(node)
-                    children.append(subtask_key)
-            if fields.has_key('subtasks') and not ignore_subtasks:
-                for subtask in fields['subtasks']:
-                    subtask_key = get_key(subtask)
-                    log(issue_key + ' => has subtask => ' + subtask_key)
-                    node = '{}->{}[color=blue][label="subtask"]'.format (
-                            create_node_text(issue_key, fields),
-                            create_node_text(subtask_key, subtask['fields']))
-                    graph.append(node)
-                    children.append(subtask_key)
+                    log(f'+(epic issue) adding node {subtask_key}')
 
-        if fields.has_key('issuelinks'):
+                    # start -- TODO hide finished epic stories
+                    if not subtask['fields']['status']['name'] in ['Closed', 'Done', 'Sandbox', 'Staging', 'Production', 'Merged']:
+                        graph.append(node)
+                        children.append(subtask_key)
+                    # graph.append(node)
+                    # children.append(subtask_key)
+                    # -- end
+
+            if 'subtasks' in fields and not ignore_subtasks:
+                for subtask in fields['subtasks']:
+
+                    # start -- TODO hide finished story subtasks
+                    if not subtask['fields']['status']['name'] in ['Closed', 'Done', 'Sandbox', 'Staging', 'Production', 'Merged']:
+                        subtask_key = get_key(subtask)
+                        log(issue_key + ' => has subtask => ' + subtask_key)
+                        node = '{}->{}[color=blue][label="subtask"]'.format (
+                                create_node_text(issue_key, fields),
+                                create_node_text(subtask_key, subtask['fields']))
+                        log(f'+(subtask) adding node {subtask_key}')
+                        graph.append(node)
+                        children.append(subtask_key)
+                    # subtask_key = get_key(subtask)
+                    # log(issue_key + ' => has subtask => ' + subtask_key)
+                    # node = '{}->{}[color=blue][label="subtask"]'.format (
+                    #         create_node_text(issue_key, fields),
+                    #         create_node_text(subtask_key, subtask['fields']))
+                    # log(f'+(subtask) adding node {subtask_key}')
+                    # graph.append(node)
+                    # children.append(subtask_key)
+                    # -- end
+
+        if 'issuelinks' in fields:
             for other_link in fields['issuelinks']:
                 result = process_link(fields, issue_key, other_link)
                 if result is not None:
@@ -198,7 +215,7 @@ def build_graph_data(start_issue_key, jira, excludes, show_directions, direction
     project_prefix = start_issue_key.split('-', 1)[0]
     return walk(start_issue_key, [])
 
-
+# TODO this does not work anymore
 def create_graph_image(graph_data, image_file, node_shape):
     """ Given a formatted blob of graphviz chart data[1], make the actual request to Google
         and store the resulting image to disk.
@@ -208,6 +225,7 @@ def create_graph_image(graph_data, image_file, node_shape):
     digraph = 'digraph{node [shape=' + node_shape +'];%s}' % ';'.join(graph_data)
 
     response = requests.post(GOOGLE_CHART_URL, data = {'cht':'gv', 'chl': digraph})
+    log(digraph)
 
     with open(image_file, 'w+') as image:
         print('Writing to ' + image_file)
@@ -247,8 +265,8 @@ def filter_duplicates(lst):
     # Enumerate the list to restore order lately; reduce the sorted list; restore order
     def append_unique(acc, item):
         return acc if acc[-1][1] == item[1] else acc.append(item) or acc
-    srt_enum = sorted(enumerate(lst), key=lambda (i, val): val)
-    return [item[1] for item in sorted(reduce(append_unique, srt_enum, [srt_enum[0]]))]
+    srt_enum = sorted(enumerate(lst), key=lambda t: t[1])
+    return [item[1] for item in sorted(functools.reduce(append_unique, srt_enum, [srt_enum[0]]))]
 
 
 def main():
@@ -260,7 +278,7 @@ def main():
     else:
         # Basic Auth is usually easier for scripts like this to deal with than Cookies.
         user = options.user if options.user is not None \
-                    else raw_input('Username: ')
+                    else input('Username: ')
         password = options.password if options.password is not None \
                     else getpass.getpass('Password: ')
         auth = (user, password)
